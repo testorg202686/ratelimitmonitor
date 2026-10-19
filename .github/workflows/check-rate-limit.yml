@@ -1,0 +1,125 @@
+
+name: Check GitHub API Rate Limit
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 09:00 Mexico City time (15:00 UTC)
+    - cron: "0 15 * * *"
+
+# This workflow does not need the repository GITHUB_TOKEN.
+permissions: {}
+
+concurrency:
+  group: check-github-api-rate-limit
+  cancel-in-progress: false
+
+jobs:
+  check-rate-limit:
+    name: Monitor authenticated token
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      GH_API_URL: https://api.github.com
+      GH_ORG: ${{ vars.GH_ORG }}
+      RATE_LIMIT_THRESHOLD: "20"
+
+    steps:
+      - name: Check token rate limit
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ORG_RATE_LIMIT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing secret ORG_RATE_LIMIT_TOKEN."
+            exit 1
+          fi
+
+          echo "Querying GitHub API rate limit..."
+
+          RESPONSE=$(curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --retry 2 \
+            --retry-delay 2 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GH_API_URL}/rate_limit")
+
+          # Validate that the API returned a usable response.
+          echo "$RESPONSE" | jq -e '.resources.core.limit > 0' \
+            >/dev/null
+
+          THRESHOLD="$RATE_LIMIT_THRESHOLD"
+          ALERT=0
+
+          {
+            echo "# GitHub API Rate Limit Report"
+            echo ""
+            echo "- **Platform:** GitHub Enterprise Cloud"
+            echo "- **Organization context:** ${GH_ORG:-Not specified}"
+            echo "- **Checked at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **Alert threshold:** ${THRESHOLD}% remaining"
+            echo ""
+            echo "| Resource | Limit | Used | Remaining | Remaining % | Reset (UTC) |"
+            echo "|---|---:|---:|---:|---:|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r RESOURCE; do
+            DATA=$(echo "$RESPONSE" | jq -c \
+              --arg resource "$RESOURCE" \
+              '.resources[$resource]')
+
+            LIMIT=$(echo "$DATA" | jq -r '.limit')
+            USED=$(echo "$DATA" | jq -r '.used')
+            REMAINING=$(echo "$DATA" | jq -r '.remaining')
+            RESET=$(echo "$DATA" | jq -r '.reset')
+
+            if (( LIMIT <= 0 )); then
+              echo "::error::Invalid limit for ${RESOURCE}."
+              exit 1
+            fi
+
+            PERCENT=$(( REMAINING * 100 / LIMIT ))
+            RESET_DATE=$(date -u -d "@${RESET}" \
+              '+%Y-%m-%d %H:%M:%S')
+
+            echo "| ${RESOURCE} | ${LIMIT} | ${USED} | ${REMAINING} | ${PERCENT}% | ${RESET_DATE} |" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+            echo "${RESOURCE}: ${REMAINING}/${LIMIT} remaining (${PERCENT}%)"
+
+            if (( PERCENT < THRESHOLD )); then
+              ALERT=1
+              echo "::warning::${RESOURCE} has only ${PERCENT}% remaining."
+            fi
+          done < <(echo "$RESPONSE" | jq -r '.resources | keys[]')
+
+          {
+            echo ""
+            if (( ALERT == 1 )); then
+              echo "## ⚠️ Rate limit alert"
+              echo ""
+              echo "At least one resource is below ${THRESHOLD}% remaining."
+              echo "Review the resource usage and reset time above."
+            else
+              echo "## ✅ Rate limit status OK"
+              echo ""
+              echo "All reported resources have at least ${THRESHOLD}% remaining."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "alert=${ALERT}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark run as failed when threshold is reached
+        if: steps.check.outputs.alert == '1'
+        shell: bash
+        run: |
+          echo "::error::GitHub API rate limit threshold reached. See the job summary."
+          exit 1
