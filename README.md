@@ -64,3 +64,4 @@ El umbral se configura mediante la variable `RATE_LIMIT_THRESHOLD` definida en e
 ## Referencia
 
 [GitHub REST API — Rate limit](https://docs.github.com/en/rest/rate-limit/rate-limit)
+[GitHub REST API — Best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
